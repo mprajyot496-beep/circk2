@@ -1,0 +1,86 @@
+# Proves the Linux streamer works on a real runner, without touching YouTube:
+# streams two minutes of a match into a file, then measures it - frame rate,
+# audio level - and publishes a frame and the numbers to the `selftest`
+# branch (selftest/frame.jpg, selftest/report.txt).
+name: selftest
+
+on:
+  workflow_dispatch:
+    inputs:
+      match:
+        description: "Cricbuzz match id (blank = whatever is live)"
+        required: false
+  push:
+    branches: [main]
+    paths:
+      - "*.py"
+      - "deploy/**"
+      - "requirements-server.txt"
+      - ".github/workflows/selftest.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PYTHONUTF8: "1"
+      CHANNEL_NAME: ${{ vars.CHANNEL_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-server.txt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            voices
+            ~/.u2net
+          key: models-v1
+      - name: Set up
+        run: bash deploy/setup_linux.sh
+      - name: Stream 2 minutes into a file
+        run: |
+          MID="${{ github.event.inputs.match }}"
+          if [ -z "$MID" ]; then
+            MID=$(python -c "import cricbuzz; m = cricbuzz.best_live(cricbuzz.scan()) or cricbuzz.scan()[0]; print(m['mid'])")
+          fi
+          echo "match $MID"
+          python streamer.py "$MID" logs/test.flv 120
+          python thumbnail.py "$MID" "1st Innings" || true
+      - name: Measure
+        if: always()
+        run: |
+          mkdir -p out
+          {
+            echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "cpus: $(nproc)"
+            ffprobe -v error -show_entries format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate -of compact logs/test.flv
+            echo "frames (distinct, not duplicated) in the file:"
+            ffmpeg -hide_banner -i logs/test.flv -vf mpdecimate -an -f null - 2>&1 | grep -o "frame=[ 0-9]*" | tail -1
+            echo "audio level:"
+            ffmpeg -hide_banner -i logs/test.flv -af volumedetect -vn -f null - 2>&1 | grep -E "mean_volume|max_volume"
+            echo "engine fps lines:"; grep "\[fps\]" logs/engine_slot1.log | tail -5
+            echo "spoken lines:"; grep -c "\[BALL\|\[\.\.\.\.\|\[EVNT\|\[OVER" logs/engine_slot1.log
+            echo "--- engine log tail"; tail -n 40 logs/engine_slot1.log
+            echo "--- ffmpeg log tail"; tail -n 20 logs/ffmpeg_slot1.log
+          } > out/report.txt 2>&1 || true
+          ffmpeg -hide_banner -loglevel error -ss 75 -i logs/test.flv -frames:v 1 out/frame.jpg || true
+          cp thumbs/*.jpg out/thumbnail.jpg 2>/dev/null || true
+          cat out/report.txt
+      - name: Publish to the selftest branch
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin selftest 2>/dev/null || true
+          git switch --orphan selftest-new
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          mkdir -p selftest && cp out/* selftest/ 2>/dev/null || true
+          git add selftest
+          git commit -m "selftest $GITHUB_RUN_ID"
+          git push -f origin HEAD:selftest

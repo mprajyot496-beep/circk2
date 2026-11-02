@@ -1,0 +1,22 @@
+# secrets - YouTube / API keys live in GitHub Secrets or the server's .env
+.env
+.env.*
+.history/
+client_secret*.json
+
+# big models, downloaded by deploy/setup_linux.sh
+voices/
+*.onnx
+
+# your own recordings, not for a public repo
+real_voices/
+reference_transcript.txt
+
+# runtime caches and output
+assets/players/
+assets/flags/
+thumbs/
+logs/
+__pycache__/
+*.pyc
+.kilo/

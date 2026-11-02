@@ -1,0 +1,73 @@
+# The channel on autopilot from GitHub's runners.
+#
+# Every 15 minutes each slot checks (in ~30 s, no heavy setup) whether there is
+# something to stream: a pick that is live or about to start, or its own
+# broadcast still open. If so it installs the streamer and runs for up to
+# 5.5 h, then hands over - the next queued run resumes into the same open
+# broadcast. One job per slot at a time (concurrency group), so a slot never
+# streams twice.
+name: live
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  slot:
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    concurrency:
+      group: live-slot-${{ matrix.slot }}
+      cancel-in-progress: false
+    env:
+      YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+      YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+      YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+      YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+      CHANNEL_NAME: ${{ vars.CHANNEL_NAME }}
+      MATCHES_PER_DAY: ${{ vars.MATCHES_PER_DAY || '2' }}
+      YT_PRIVACY: ${{ vars.YT_PRIVACY || 'public' }}
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-server.txt
+
+      - name: Anything to stream?
+        id: check
+        run: |
+          pip install -q curl_cffi==0.6.0
+          python autopilot.py --slot ${{ matrix.slot }} --check
+
+      - name: Restore models
+        if: steps.check.outputs.work == '1'
+        uses: actions/cache@v4
+        with:
+          path: |
+            voices
+            ~/.u2net
+          key: models-v1
+
+      - name: Set up the streamer
+        if: steps.check.outputs.work == '1'
+        run: bash deploy/setup_linux.sh
+
+      - name: Stream
+        if: steps.check.outputs.work == '1'
+        run: python autopilot.py --slot ${{ matrix.slot }} --max-minutes 330
+
+      - name: Engine / ffmpeg log tail
+        if: always() && steps.check.outputs.work == '1'
+        run: tail -n 60 logs/*.log 2>/dev/null || true
