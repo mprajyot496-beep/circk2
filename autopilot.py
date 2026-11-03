@@ -47,7 +47,8 @@ import picker
 POLL = 20                 # seconds between Cricbuzz checks while streaming
 GRACE = 80                # seconds of break / result talk before cutting
 MAX_IDLE_LIVE = 90 * 60   # a stoppage this long (rain) ends the broadcast
-SOON = 25 * 60            # a pick starting within this is waited for
+SOON = 70 * 60            # a pick starting within this is waited for - GitHub's
+                          # "every 15 min" schedule really fires about hourly
 LIVE_BCAST = ("created", "ready", "testing", "liveStarting", "live")
 CHANNEL = os.environ.get("CHANNEL_NAME", "")
 
