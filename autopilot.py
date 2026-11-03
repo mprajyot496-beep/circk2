@@ -61,6 +61,38 @@ def log(msg):
 
 
 # ── where a match is ───────────────────────────────────────────────────────
+MAX_OVERS = {"T20": 20, "T20I": 20, "IT20": 20, "ODI": 50, "ODM": 50, "T10": 10}
+
+
+def innings_done(mini, h, inn, fmt):
+    """Is the innings in play finished, judged from the score itself?
+    Cricbuzz can keep saying "In Progress" for minutes after the last ball
+    of an innings (seen live: 97/9 after 20.0 overs, still "In Progress"),
+    so its state alone cannot end a stream."""
+    sc = next((s for s in ((mini.get("matchScoreDetails") or {})
+                           .get("inningsScoreList") or [])
+               if s.get("inningsId") == inn), None)
+    if sc is None:
+        bt = mini.get("batTeam") or {}
+        sc = {"score": bt.get("teamScore"), "wickets": bt.get("teamWkts"),
+              "overs": mini.get("overs")}
+    runs = int(sc.get("score") or 0)
+    wkts = int(sc.get("wickets") or 0)
+    try:
+        overs = float(sc.get("overs") or mini.get("overs") or 0)
+    except (TypeError, ValueError):
+        overs = 0.0
+    limit = MAX_OVERS.get(fmt)
+    text = " ".join(str(x or "") for x in (h.get("status"), mini.get("status")))
+    m = re.search(r"reduced to (\d+) overs", text, re.I)
+    if m:
+        limit = int(m.group(1))
+    target = int(mini.get("target") or 0)
+    return (wkts >= 10 or bool(sc.get("isDeclared"))
+            or (limit and overs >= limit)
+            or (inn >= 2 and target and runs >= target))
+
+
 def where(mid):
     """The match right now: which part is on, and whether play is live."""
     _, mini, h = cricbuzz.match_data(mid)
@@ -70,6 +102,7 @@ def where(mid):
     state = str(h.get("state") or "").lower()
     inn = int(mini.get("inningsId") or 1)
     test = fmt in ("TEST", "FIRST-CLASS")
+    complete = cricbuzz.finished(h)
     if test:
         m = re.search(r"Day (\d+)", h.get("status") or "")
         start = (h.get("matchStartTimestamp") or 0) / 1000.0
@@ -78,9 +111,14 @@ def where(mid):
     else:
         key = "1" if inn <= 1 else "2"
         label = "1st Innings" if key == "1" else "2nd Innings"
+        if state == "in progress" and innings_done(mini, h, inn, fmt):
+            if inn <= 1:
+                state = "innings break"     # the feed has not caught up yet
+            else:
+                complete = True             # chase over: result is coming
     return {"key": key, "label": label, "state": state, "test": test,
             "playing": state == "in progress",
-            "complete": bool(h.get("complete")), "header": h}
+            "complete": complete, "header": h}
 
 
 def part_over(w, part):
@@ -146,6 +184,9 @@ def schedule_entry(mid, sched=None):
             "state": h.get("state", ""), "live": True, "done": False}
 
 
+PLAN = ""          # the day's picks as last decided, for the run's annotation
+
+
 def decide(slot, with_buzz=True):
     """What this slot should do now:
          ("resume", broadcast, match)  a broadcast of ours is still live
@@ -167,10 +208,13 @@ def decide(slot, with_buzz=True):
 
     bc = [b for b in bc if b["mid"]]
     today = picker.ist_day(now)
-    used_today = []
-    for b in sorted(bc, key=lambda b: b["created"]):
-        if picker.ist_day(b["created"]) == today and b["mid"] not in used_today:
-            used_today.append(b["mid"])
+    # a match counts on the day its FIRST stream started - a 23:30 game's
+    # 2nd innings after midnight is not one of tomorrow's matches
+    first = {}
+    for b in bc:
+        first[b["mid"]] = min(first.get(b["mid"], b["created"]), b["created"])
+    used_today = [mid for mid, t in sorted(first.items(), key=lambda x: x[1])
+                  if picker.ist_day(t) == today]
     owner = {}                                  # match -> slot, latest wins
     for b in sorted(bc, key=lambda b: b["created"]):
         owner[b["mid"]] = b["slot"]
@@ -192,14 +236,24 @@ def decide(slot, with_buzz=True):
             return ("wait", 60, schedule_entry(mid))
 
     # 3. a new pick
+    global PLAN
     if len(used_today) >= picker.MATCHES_PER_DAY:
-        return ("idle", "today's %d matches are taken: %s"
-                % (picker.MATCHES_PER_DAY, ", ".join(used_today)))
+        PLAN = "today's %d matches: %s (both chosen)" % (
+            picker.MATCHES_PER_DAY, ", ".join(used_today))
+        return ("idle", PLAN)
     sched = picker.schedule()
     cands = [c for c in picker.rank(picker.today_candidates(sched, now),
                                     with_buzz=with_buzz)
              if c["hype"] >= picker.MIN_SCORE and c["mid"] not in owner]
-    picks = cands[:picker.MATCHES_PER_DAY - len(used_today)]
+    # the day's remaining picks by hype, handed to the slots by start time:
+    # with both slots free, slot 1 takes the earlier match and slot 2 the
+    # later; a lone free slot takes the next one. Same answer in both
+    # slots' runs, so they never pick the same match.
+    picks = sorted(cands[:picker.MATCHES_PER_DAY - len(used_today)],
+                   key=lambda c: c["start"])
+    PLAN = "streamed today: %s | still to come: %s" % (
+        ", ".join(used_today) or "none",
+        "; ".join(picker.describe(c) for c in picks) or "nothing worth it")
     idx = 1 if (slot == 2 and not other_busy) else 0
     if idx >= len(picks):
         return ("idle", "no pick for slot %d (candidates: %s)" % (
@@ -290,8 +344,10 @@ def run(slot, deadline, forever, check=False):
                 what = kind if kind != "idle" else "idle - " + d[1]
                 log("slot %d: %s" % (slot, what))
                 if os.environ.get("GITHUB_ACTIONS"):
-                    # an annotation: readable on the run page without logs
+                    # annotations: readable on the run page without logs
                     print("::notice title=slot %d::%s" % (slot, what))
+                    if PLAN:
+                        print("::notice title=today's plan::%s" % PLAN)
                 return kind != "idle"
             if kind == "idle":
                 log("slot %d idle: %s" % (slot, d[1]))

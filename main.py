@@ -267,7 +267,7 @@ def commentate(m, sp, sit, director, scene):
                 sp.say_many(lines, "break")
 
         # -- finished? -------------------------------------------------------
-        if header.get("complete"):
+        if cricbuzz.finished(header):
             lines = director.result_lines(header.get("status"))
             if scene:
                 lines = with_cues(lines, {0: scene.event_cue("RESULT",

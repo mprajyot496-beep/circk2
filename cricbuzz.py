@@ -27,6 +27,19 @@ LIVE_STATES = ("in progress", "innings break", "rain", "drinks",
                "wet outfield")
 
 
+FINAL_STATES = ("complete", "abandon", "no result", "cancel")
+
+
+def finished(header):
+    """Is the match really over? The header's `complete` flag is not enough:
+    Cricbuzz sets it during an innings break too (seen live: complete=True,
+    state "Innings Break", empty result). Over means a final state or a
+    result."""
+    state = str(header.get("state") or "").lower()
+    return (any(s in state for s in FINAL_STATES)
+            or bool((header.get("result") or {}).get("resultType")))
+
+
 def _json(path, timeout=25):
     try:
         r = creq.get(SITE + path, impersonate="chrome", timeout=timeout)
@@ -107,8 +120,8 @@ def scan(limit=14):
             "state": header.get("state") or "?",
             "format": str(header.get("matchFormat") or "?").upper(),
             "status": header.get("status") or "",
-            "complete": bool(header.get("complete")),
-            "playing": state in LIVE_STATES and not header.get("complete"),
+            "complete": finished(header),
+            "playing": state in LIVE_STATES and not finished(header),
             "has_score": bool((mini.get("batTeam") or {}).get("teamScore")),
         })
     out.sort(key=lambda m: (not m["playing"],
