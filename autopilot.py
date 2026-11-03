@@ -286,7 +286,11 @@ def run(slot, deadline, forever, check=False):
             d = decide(slot, with_buzz=not check)
             kind = d[0]
             if check:
-                log("slot %d: %s" % (slot, kind if kind != "idle" else "idle - " + d[1]))
+                what = kind if kind != "idle" else "idle - " + d[1]
+                log("slot %d: %s" % (slot, what))
+                if os.environ.get("GITHUB_ACTIONS"):
+                    # an annotation: readable on the run page without logs
+                    print("::notice title=slot %d::%s" % (slot, what))
                 return kind != "idle"
             if kind == "idle":
                 log("slot %d idle: %s" % (slot, d[1]))
@@ -344,6 +348,8 @@ def main():
     if a.check:
         if not os.environ.get("YT_REFRESH_TOKEN"):
             log("YouTube is not connected yet (secret YT_REFRESH_TOKEN) - nothing to do")
+            if os.environ.get("GITHUB_ACTIONS"):
+                print("::warning title=not connected::secret YT_REFRESH_TOKEN is missing")
             work = False
         else:
             work = run(a.slot, deadline, False, check=True)

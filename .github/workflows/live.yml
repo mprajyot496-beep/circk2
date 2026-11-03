@@ -12,6 +12,9 @@ on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
+  push:
+    # pushing a change to this file starts a check right away
+    paths: [".github/kick"]
 
 permissions:
   contents: read
@@ -39,9 +42,9 @@ jobs:
       YT_PRIVACY: ${{ vars.YT_PRIVACY || 'public' }}
       PYTHONUTF8: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
