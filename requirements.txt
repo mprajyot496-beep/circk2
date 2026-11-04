@@ -1,0 +1,9 @@
+curl_cffi
+piper-tts
+pygame
+numpy
+kokoro-onnx
+onnxruntime
+panda3d
+pillow
+scipy

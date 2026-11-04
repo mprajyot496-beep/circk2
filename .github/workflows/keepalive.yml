@@ -1,0 +1,30 @@
+# GitHub switches off scheduled workflows in a public repo after 60 days
+# without activity. Twice a month this makes some (a one-line commit) and
+# re-enables the live workflow in case it was switched off anyway.
+name: keepalive
+
+on:
+  schedule:
+    - cron: "17 4 1,15 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Commit a heartbeat
+        run: |
+          date -u +%Y-%m-%dT%H:%M:%SZ > .github/heartbeat
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/heartbeat
+          git commit -m "heartbeat" && git push || echo "nothing to push"
+      - name: Keep the live workflow enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable live.yml --repo "$GITHUB_REPOSITORY" || true
