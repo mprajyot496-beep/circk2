@@ -38,6 +38,9 @@ TOP_NATIONS = ("pakistan", "australia", "england", "south africa",
 SERIES = [
     ("indian premier league", 95), ("ipl", 95),
     ("women's premier league", 45), ("wpl", 45),
+    # associate-level "World Cup" competitions before the real one
+    ("world cup league", 15), ("cwc league", 15), ("world cup qualifier", 25),
+    ("world cup challenge", 15),
     ("asia cup", 60), ("world cup", 60), ("champions trophy", 70),
     ("world test championship", 40),
     ("big bash", 35), ("bbl", 35), ("pakistan super league", 35),

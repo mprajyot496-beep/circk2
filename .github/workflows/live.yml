@@ -1,34 +1,50 @@
 # The channel on autopilot from GitHub's runners.
 #
-# Every 15 minutes each slot checks (in ~30 s, no heavy setup) whether there is
-# something to stream: a pick that is live or about to start, or its own
-# broadcast still open. If so it installs the streamer and runs for up to
-# 5.5 h, then hands over - the next queued run resumes into the same open
-# broadcast. One job per slot at a time (concurrency group), so a slot never
-# streams twice.
+# Every 15 minutes (in practice about hourly) each slot checks, in ~30 s and
+# without the heavy setup, whether there is something to stream: a pick that
+# is live or about to start, or its own broadcast still open. If so it
+# installs the streamer and runs.
+#
+# GitHub stops a job after 6 hours; an ODI lasts ~8. So 12 minutes before its
+# limit a streaming job starts its successor (lane a, then b, then a ...). The
+# successor warms the engine up and takes the stream over the moment the old
+# job lets go - a gap of seconds, not a wait for the next scheduled run.
+#
+# The same file runs in a second, standby repo (ROLE fallback): it only steps
+# in when something should be on air and has not been for 10 minutes. The
+# slot's stream key works as the lock - a runner never resumes a stream that
+# someone else is already pushing.
 name: live
 
 on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
+    inputs:
+      slot:
+        description: "slot (blank = both)"
+        required: false
+      lane:
+        description: "successor lane a/b (set by a job handing over)"
+        required: false
   push:
     # pushing a change to this file starts a check right away
     paths: [".github/kick"]
 
 permissions:
   contents: read
+  actions: write          # a job starts its own successor
 
 jobs:
   slot:
     strategy:
       fail-fast: false
       matrix:
-        slot: [1, 2]
+        slot: ${{ fromJSON(inputs.slot && format('[{0}]', inputs.slot) || '[1, 2]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     concurrency:
-      group: live-slot-${{ matrix.slot }}
+      group: live-slot-${{ matrix.slot }}${{ inputs.lane && format('-{0}', inputs.lane) || '' }}
       cancel-in-progress: false
     env:
       YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
@@ -40,6 +56,11 @@ jobs:
       CHANNEL_NAME: ${{ vars.CHANNEL_NAME }}
       MATCHES_PER_DAY: ${{ vars.MATCHES_PER_DAY || '2' }}
       YT_PRIVACY: ${{ vars.YT_PRIVACY || 'public' }}
+      # the main repo streams; any other copy is the standby (override with
+      # a repo variable ROLE if the main repo ever goes away)
+      ROLE: ${{ vars.ROLE || (github.repository == 'crickp88-debug/crick-' && 'primary' || 'fallback') }}
+      HANDOVER_LANE: ${{ inputs.lane }}
+      GH_TOKEN: ${{ github.token }}
       PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v5

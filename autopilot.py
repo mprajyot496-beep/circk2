@@ -31,6 +31,7 @@ import re
 import sys
 import time
 import argparse
+import subprocess
 import traceback
 
 try:
@@ -49,6 +50,13 @@ GRACE = 80                # seconds of break / result talk before cutting
 MAX_IDLE_LIVE = 90 * 60   # a stoppage this long (rain) ends the broadcast
 SOON = 70 * 60            # a pick starting within this is waited for - GitHub's
                           # "every 15 min" schedule really fires about hourly
+LATE = 3 * 3600           # ...and still waited for this long past its start
+HANDOVER_LEAD = 12 * 60   # a GitHub job starts its successor this long before
+                          # its time is up (6 h job limit)
+TAKEOVER = 10 * 60        # the fallback repo steps in only after something
+                          # has been missing this long
+ROLE = os.environ.get("ROLE", "primary")      # "fallback": the standby repo
+HANDED_OVER = False
 LIVE_BCAST = ("created", "ready", "testing", "liveStarting", "live")
 CHANNEL = os.environ.get("CHANNEL_NAME", "")
 
@@ -185,15 +193,30 @@ def schedule_entry(mid, sched=None):
 
 
 PLAN = ""          # the day's picks as last decided, for the run's annotation
+MINE = set()       # broadcasts this process created or took over
+_stream_ids = {}
 
 
-def decide(slot, with_buzz=True):
+def stream_id(slot):
+    if slot not in _stream_ids:
+        _stream_ids[slot] = ytlive.stream_for_slot(slot)
+    return _stream_ids[slot]
+
+
+def stream_busy(slot):
+    """Is something already pushing video into this slot's stream key? The
+    lock between runners: a relay job, the fallback repo, a server."""
+    return ytlive.stream_status(stream_id(slot)[0])[0] == "active"
+
+
+def decide(slot, with_buzz=True, handover=False):
     """What this slot should do now:
-         ("resume", broadcast, match)  a broadcast of ours is still live
-         ("stream", None, match, w)    start the part that is on now
-         ("wait", seconds, match)      a part / pick starts soon
+         ("resume", broadcast, match, w)  a broadcast of ours is still open
+         ("stream", None, match, w)       start the part that is on now
+         ("wait", seconds, match)         a part / pick starts soon
          ("idle", reason)
-    """
+    handover: this job was started by a job about to hit GitHub's 6 h limit,
+    to take over its open broadcast - the stream being busy is expected."""
     bc = ytlive.recent(30)
     now = time.time()
 
@@ -202,19 +225,19 @@ def decide(slot, with_buzz=True):
         if b["slot"] == slot and b["status"] in LIVE_BCAST and b["mid"]:
             w = where(b["mid"])
             if w and not part_over(w, b["part"]):
+                if not handover and b["id"] not in MINE:
+                    if stream_busy(slot):
+                        return ("idle", "slot %d is on air from another runner" % slot)
+                    if now - b["created"] < 8 * 60:
+                        return ("idle", "slot %d broadcast was just created by "
+                                        "another runner" % slot)
                 return ("resume", b, schedule_entry(b["mid"]), w)
             log("closing %s (%s) - its part is over" % (b["id"], b["title"]))
             ytlive.finish(b["id"])
 
     bc = [b for b in bc if b["mid"]]
     today = picker.ist_day(now)
-    # a match counts on the day its FIRST stream started - a 23:30 game's
-    # 2nd innings after midnight is not one of tomorrow's matches
-    first = {}
-    for b in bc:
-        first[b["mid"]] = min(first.get(b["mid"], b["created"]), b["created"])
-    used_today = [mid for mid, t in sorted(first.items(), key=lambda x: x[1])
-                  if picker.ist_day(t) == today]
+    yesterday = picker.ist_day(now - 86400)
     owner = {}                                  # match -> slot, latest wins
     for b in sorted(bc, key=lambda b: b["created"]):
         owner[b["mid"]] = b["slot"]
@@ -235,40 +258,58 @@ def decide(slot, with_buzz=True):
         if w["state"] in SOON_STATES:
             return ("wait", 60, schedule_entry(mid))
 
-    # 3. a new pick
+    # 3. a new pick. Each day's MATCHES_PER_DAY are chosen among the matches
+    # SCHEDULED that day (IST), so a 23:30 game that starts late after rain
+    # stays last night's pick instead of losing its place to tomorrow's.
     global PLAN
-    if len(used_today) >= picker.MATCHES_PER_DAY:
-        PLAN = "today's %d matches: %s (both chosen)" % (
-            picker.MATCHES_PER_DAY, ", ".join(used_today))
-        return ("idle", PLAN)
     sched = picker.schedule()
-    cands = [c for c in picker.rank(picker.today_candidates(sched, now),
-                                    with_buzz=with_buzz)
-             if c["hype"] >= picker.MIN_SCORE and c["mid"] not in owner]
-    # the day's remaining picks by hype, handed to the slots by start time:
-    # with both slots free, slot 1 takes the earlier match and slot 2 the
-    # later; a lone free slot takes the next one. Same answer in both
-    # slots' runs, so they never pick the same match.
-    picks = sorted(cands[:picker.MATCHES_PER_DAY - len(used_today)],
-                   key=lambda c: c["start"])
+    by_mid = {m["mid"]: m for m in sched}
+
+    def day_of(mid):
+        m = by_mid.get(mid) or schedule_entry(mid, sched)
+        return picker.ist_day(m["start"]) if m.get("start") else today
+
+    pool = [m for m in sched
+            if not m["done"] and m["mid"] not in owner and (
+                picker.ist_day(m["start"]) == today
+                or (picker.ist_day(m["start"]) == yesterday
+                    and (m["live"] or now - m["start"] < LATE)))]
+    ranked = [c for c in picker.rank(pool, with_buzz=with_buzz)
+              if c["hype"] >= picker.MIN_SCORE]
+    picks, used = [], {}
+    for day in (yesterday, today):
+        used[day] = [mid for mid in owner if day_of(mid) == day]
+        room = picker.MATCHES_PER_DAY - len(used[day])
+        if room > 0:
+            picks += [c for c in ranked if picker.ist_day(c["start"]) == day][:room]
+    # handed to the slots by start time: with both slots free, slot 1 takes
+    # the earlier match and slot 2 the later; a lone free slot takes the
+    # next one. Same answer in both slots' runs, so they never collide.
+    picks.sort(key=lambda c: c["start"])
     PLAN = "streamed today: %s | still to come: %s" % (
-        ", ".join(used_today) or "none",
+        ", ".join(used[today]) or "none",
         "; ".join(picker.describe(c) for c in picks) or "nothing worth it")
     idx = 1 if (slot == 2 and not other_busy) else 0
     if idx >= len(picks):
-        return ("idle", "no pick for slot %d (candidates: %s)" % (
-            slot, "; ".join(picker.describe(c) for c in cands[:3]) or "none"))
+        return ("idle", "no pick for slot %d - %s" % (slot, PLAN))
     m = picks[idx]
     w = where(m["mid"])
     if w and w["playing"]:
         return ("stream", None, m, w)
-    if (w and w["state"] in SOON_STATES) or 0 < m["start"] - now < SOON:
+    # about to start, or past its start time but not under way yet (toss,
+    # rain, a late start): keep waiting rather than give its place away
+    if (w and w["state"] in SOON_STATES) or -LATE < m["start"] - now < SOON:
         return ("wait", 60, m)
     return ("idle", "next pick %s" % picker.describe(m))
 
 
 def go_live(slot, m, w, stream_id):
     bc = ytlive.recent(30)
+    if any(b["mid"] == m["mid"] and b["part"] == w["key"]
+           and b["status"] in LIVE_BCAST for b in bc):
+        log("%s v %s %s is already open (another runner) - not creating"
+            % (m["t1"], m["t2"], w["label"]))
+        return None
     n = sum(1 for b in bc if b["mid"] == m["mid"] and b["part"] == w["key"])
     label = w["label"] + (" (Part %d)" % (n + 1) if n else "")
     title, text, tags = metadata(m, label)
@@ -281,20 +322,63 @@ def go_live(slot, m, w, stream_id):
     ref = "ref: cb%s p%s s%d" % (m["mid"], w["key"], slot)
     bid = ytlive.create(title, text, ref, stream_id, thumb, tags,
                         os.environ.get("YT_PRIVACY", "public"))
+    MINE.add(bid)
     log("broadcast %s created: %s" % (bid, title))
     return {"id": bid, "mid": m["mid"], "part": w["key"], "title": title}
 
 
-def stream_part(slot, b, rtmp, deadline):
+def dispatch_successor(slot):
+    """Start the next GitHub job for this slot now, while this one still has
+    HANDOVER_LEAD minutes left. It loads the engine and takes the stream over
+    the moment this job lets go - seconds of gap instead of a wait for the
+    next scheduled run. Lanes a/b alternate so the two jobs never share a
+    concurrency group."""
+    if not (os.environ.get("GITHUB_ACTIONS") and os.environ.get("GH_TOKEN")):
+        return False
+    lane = "b" if os.environ.get("HANDOVER_LANE") == "a" else "a"
+    p = subprocess.run(
+        ["gh", "workflow", "run", "live.yml",
+         "--repo", os.environ["GITHUB_REPOSITORY"],
+         "--ref", os.environ.get("GITHUB_REF_NAME", "main"),
+         "-f", "slot=%d" % slot, "-f", "lane=%s" % lane],
+        capture_output=True, text=True, timeout=90)
+    ok = p.returncode == 0
+    log("successor job (lane %s) %s %s" % (lane, "started" if ok else "FAILED:",
+                                           "" if ok else p.stderr[-300:]))
+    return ok
+
+
+def take_over_gate(slot, bid, limit=25 * 60):
+    """For a successor job: wait - engine already warm - until the old job
+    stops pushing, then go. False if the broadcast closed meanwhile."""
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        if ytlive.status(bid) not in LIVE_BCAST:
+            return False
+        if not stream_busy(slot):
+            return True
+        time.sleep(5)
+    return True
+
+
+def stream_part(slot, b, rtmp, deadline, successor=False):
     """Stream one part into broadcast b until it ends (True) or the job's
-    time is up (False - the broadcast is left open for the next run)."""
+    time is up (False - the broadcast is left open for the successor job /
+    the next run). successor: wait for the previous job to let go first."""
+    global HANDED_OVER
     from streamer import Streamer
     s = Streamer(slot, b["mid"], rtmp)
     restarts, quiet_since, over_since = 0, None, None
+    gate = (lambda: take_over_gate(slot, b["id"])) if successor else None
     try:
-        s.start()
+        if not s.start(gate=gate):
+            log("broadcast %s closed before the takeover" % b["id"])
+            return True
         log("on air: %s" % b["title"])
         while True:
+            if (not HANDED_OVER and deadline != float("inf")
+                    and time.time() > deadline - HANDOVER_LEAD):
+                HANDED_OVER = dispatch_successor(slot)
             if time.time() > deadline:
                 log("job time is up - leaving %s open for the next run" % b["id"])
                 return False
@@ -332,20 +416,25 @@ def stream_part(slot, b, rtmp, deadline):
         s.stop()
 
 
-def run(slot, deadline, forever, check=False):
-    stream_id = rtmp = None
+def run(slot, deadline, forever, check=False, handover=False):
+    fallback = ROLE == "fallback"
     while time.time() < deadline:
         try:
-            if slot == 2 and not check:
+            if slot == 2 and not check and not handover:
                 time.sleep(45)          # let slot 1 claim its pick first
-            d = decide(slot, with_buzz=not check)
+            d = decide(slot, with_buzz=not (check or fallback), handover=handover)
             kind = d[0]
+            if fallback and kind == "wait":
+                # waiting for a start is the main repo's job; the fallback
+                # only steps in once something should be on air and is not
+                kind, d = "idle", ("idle", "fallback: main repo waits for %s v %s"
+                                   % (d[2]["t1"], d[2]["t2"]))
             if check:
                 what = kind if kind != "idle" else "idle - " + d[1]
-                log("slot %d: %s" % (slot, what))
+                log("slot %d (%s): %s" % (slot, ROLE, what))
                 if os.environ.get("GITHUB_ACTIONS"):
                     # annotations: readable on the run page without logs
-                    print("::notice title=slot %d::%s" % (slot, what))
+                    print("::notice title=slot %d (%s)::%s" % (slot, ROLE, what))
                     if PLAN:
                         print("::notice title=today's plan::%s" % PLAN)
                 return kind != "idle"
@@ -360,16 +449,43 @@ def run(slot, deadline, forever, check=False):
                                                          d[2].get("state")))
                 time.sleep(d[1])
                 continue
-            if stream_id is None:
-                stream_id, rtmp = ytlive.stream_for_slot(slot)
+            if fallback and not handover:
+                # give the main repo time to do it first; act only if the
+                # same thing is still missing after TAKEOVER
+                log("fallback: %s for %s v %s is due - giving the main repo %d min"
+                    % (kind, d[2]["t1"], d[2]["t2"], TAKEOVER // 60))
+                time.sleep(TAKEOVER)
+                d2 = decide(slot, with_buzz=False)
+                if d2[0] != kind or d2[2]["mid"] != d[2]["mid"]:
+                    log("fallback: the main repo has it - standing down")
+                    continue
+                d = d2
+                log("fallback: taking over")
+            _, rtmp = stream_id(slot)
             if kind == "resume":
                 b = d[1]
+                if not handover:
+                    # make sure no other runner is about to pick it up
+                    time.sleep(60)
+                    if stream_busy(slot):
+                        log("slot %d went on air elsewhere - standing down" % slot)
+                        continue
+                MINE.add(b["id"])
                 log("resuming %s" % b["title"])
             else:
-                b = go_live(slot, d[2], d[3], stream_id)
-            if stream_part(slot, b, rtmp, deadline):
+                b = go_live(slot, d[2], d[3], stream_id(slot)[0])
+                if b is None:
+                    continue
+            done = stream_part(slot, b, rtmp, deadline, successor=handover)
+            handover = False
+            if done:
                 ytlive.finish(b["id"])
                 log("broadcast %s finished" % b["id"])
+                if HANDED_OVER:
+                    log("the successor job carries on from here")
+                    return
+            else:
+                return                  # out of time; the successor has it
         except KeyboardInterrupt:
             raise
         except Exception:
@@ -402,6 +518,8 @@ def main():
     if a.plan:
         return plan()
     deadline = float("inf") if a.forever else time.time() + a.max_minutes * 60
+    # started by a job about to hit its time limit (live.yml lane a/b)
+    handover = bool(os.environ.get("HANDOVER_LANE"))
     if a.check:
         if not os.environ.get("YT_REFRESH_TOKEN"):
             log("YouTube is not connected yet (secret YT_REFRESH_TOKEN) - nothing to do")
@@ -409,13 +527,13 @@ def main():
                 print("::warning title=not connected::secret YT_REFRESH_TOKEN is missing")
             work = False
         else:
-            work = run(a.slot, deadline, False, check=True)
+            work = run(a.slot, deadline, False, check=True, handover=handover)
         out = os.environ.get("GITHUB_OUTPUT")
         if out:
             with open(out, "a") as f:
                 f.write("work=%s\n" % ("1" if work else "0"))
         return
-    run(a.slot, deadline, a.forever)
+    run(a.slot, deadline, a.forever, handover=handover)
 
 
 if __name__ == "__main__":

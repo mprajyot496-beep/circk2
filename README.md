@@ -493,4 +493,16 @@ bash deploy/install_server.sh          # SLOTS=1 for a single slot
 journalctl -u crick-live@1 -f
 ```
 
-Run **one** of the two, not both - each would stream the same slots.
+**ODIs and the 6 h job limit:** 12 minutes before a GitHub job's limit it
+starts its successor (`lane` a/b); the successor warms the engine up and takes
+the same broadcast over the moment the old job stops pushing - seconds of gap.
+
+**Standby repo** (`mprajyot496-beep/circk2`): the same code and secrets. Any
+repo other than `crickp88-debug/crick-` runs as `ROLE=fallback`: it never
+starts a stream the main repo is about to start - it steps in only when a
+pick is live (or a broadcast open) with nothing on air for 10 minutes. The
+slot's stream key is the lock: no runner resumes a stream someone else is
+pushing. Set the repo variable `ROLE=primary` there if the main repo is gone.
+
+A server running `install_server.sh` acts as a primary - don't run it next to
+the main GitHub repo.

@@ -64,7 +64,10 @@ class Streamer:
         self.ffmpeg_restarts = 0
 
     # -- start ----------------------------------------------------------
-    def start(self, wait_live=150):
+    def start(self, wait_live=150, gate=None):
+        """Screen, speaker, engine, then ffmpeg. gate: called with the engine
+        warm, just before going on air - it may wait (a successor job waiting
+        for the old one to let go); False aborts, and start returns False."""
         if not shutil.which("Xvfb") or not shutil.which("ffmpeg"):
             raise RuntimeError("Xvfb / ffmpeg not installed (run deploy/setup_linux.sh)")
         lock = "/tmp/.X%d-lock" % (90 + self.slot)
@@ -98,7 +101,10 @@ class Streamer:
                 break
             time.sleep(2)
         time.sleep(4)               # first frames drawn, first line queued
+        if gate is not None and not gate():
+            return False
         self._start_ffmpeg()
+        return True
 
     def _start_ffmpeg(self):
         g = str(FPS * 2)            # a keyframe every 2 s, as YouTube asks
